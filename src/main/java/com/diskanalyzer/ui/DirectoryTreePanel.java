@@ -1,5 +1,6 @@
 package com.diskanalyzer.ui;
 
+import com.diskanalyzer.AppSettings;
 import com.diskanalyzer.model.FileNode;
 import com.diskanalyzer.model.FileSystemNode;
 import com.diskanalyzer.model.FolderNode;
@@ -12,29 +13,32 @@ import javax.swing.tree.DefaultTreeModel;
 import javax.swing.tree.TreePath;
 import java.awt.*;
 import java.awt.event.KeyEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 public class DirectoryTreePanel extends JPanel {
 
-    // ── Tree ────────────────────────────────────────────────────────
-    private JTree             tree;
-    private DefaultTreeModel  treeModel;
-    private SizeTreeCellRenderer cellRenderer;
+    // ── Tree ─────────────────────────────────────────────────────────
+    private JTree                    tree;
+    private DefaultTreeModel         treeModel;
+    private SizeTreeCellRenderer     cellRenderer;
 
-    // ── Data ────────────────────────────────────────────────────────
-    /** Full scanned tree (dirs + files) — never displayed directly; used as source of truth. */
+    // ── Data ─────────────────────────────────────────────────────────
+    /** Full scanned tree (dirs + files) — source of truth; display model is a filtered copy. */
     private DefaultMutableTreeNode storedRoot;
 
     // ── State ────────────────────────────────────────────────────────
-    private boolean sortBySize      = true;
-    private boolean showFiles       = false;
-    private boolean confirmDeletion = true;
+    private boolean sortBySize = true;
+    private boolean showFiles  = false;
+    private boolean deletionInProgress = false;
 
     // ── Toolbar controls ─────────────────────────────────────────────
     private JToggleButton sortBySizeBtn;
@@ -43,11 +47,14 @@ public class DirectoryTreePanel extends JPanel {
     private JButton       collapseAllBtn;
     private JCheckBox     showFilesChk;
     private JButton       deleteBtn;
-    private JCheckBox     confirmDeleteChk;
 
-    // ── Callback ─────────────────────────────────────────────────────
-    /** Called after a successful deletion with a human-readable summary. */
-    private Consumer<String> onDeleteCallback = msg -> {};
+    // ── Callbacks ────────────────────────────────────────────────────
+    /** Called with status-bar messages (progress, completion, errors). */
+    private Consumer<String>  onStatusCallback  = msg -> {};
+    /** Called with true when deletion starts, false when it finishes. */
+    private Consumer<Boolean> onBusyCallback    = busy -> {};
+    /** Called with the final result message after a successful deletion. */
+    private Consumer<String>  onDeleteCallback  = msg -> {};
 
     public DirectoryTreePanel() {
         setLayout(new BorderLayout(0, 4));
@@ -60,7 +67,7 @@ public class DirectoryTreePanel extends JPanel {
     // ═══════════════════════════════════════════════════════════════
 
     private void initComponents() {
-        // ── Toolbar: row 1 — sort + expand ───────────────────────────
+        // ── Row 1: sort + expand ─────────────────────────────────────
         JPanel row1 = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 1));
 
         JLabel sortLabel = new JLabel("Sort:");
@@ -84,11 +91,11 @@ public class DirectoryTreePanel extends JPanel {
         row1.add(sortLabel);
         row1.add(sortBySizeBtn);
         row1.add(sortByNameBtn);
-        row1.add(separator());
+        row1.add(sep());
         row1.add(expandAllBtn);
         row1.add(collapseAllBtn);
 
-        // ── Toolbar: row 2 — files + delete ──────────────────────────
+        // ── Row 2: file visibility + delete ──────────────────────────
         JPanel row2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 1));
 
         showFilesChk = new JCheckBox("Show Files", showFiles);
@@ -104,14 +111,9 @@ public class DirectoryTreePanel extends JPanel {
         deleteBtn.setForeground(new Color(255, 100, 80));
         deleteBtn.addActionListener(e -> deleteSelected());
 
-        confirmDeleteChk = new JCheckBox("Confirm deletion", confirmDeletion);
-        confirmDeleteChk.setToolTipText("Show a confirmation dialog before deleting");
-        confirmDeleteChk.addActionListener(e -> confirmDeletion = confirmDeleteChk.isSelected());
-
         row2.add(showFilesChk);
-        row2.add(separator());
+        row2.add(sep());
         row2.add(deleteBtn);
-        row2.add(confirmDeleteChk);
 
         // ── Toolbar wrapper ───────────────────────────────────────────
         JPanel toolbar = new JPanel();
@@ -121,25 +123,30 @@ public class DirectoryTreePanel extends JPanel {
 
         // ── Tree ─────────────────────────────────────────────────────
         cellRenderer = new SizeTreeCellRenderer();
-        tree = new JTree(new DefaultMutableTreeNode("No data — select a disk and press Analyze"));
+        tree = new JTree(new DefaultMutableTreeNode(
+                "No data — select a disk and press Analyze"));
         tree.setCellRenderer(cellRenderer);
         tree.setRootVisible(true);
         tree.setShowsRootHandles(true);
         tree.setRowHeight(24);
         ToolTipManager.sharedInstance().registerComponent(tree);
 
-        // Selection → enable/disable delete button
         tree.addTreeSelectionListener(e -> updateDeleteButtonState());
 
         // Delete key binding
         tree.getInputMap(JComponent.WHEN_FOCUSED)
             .put(KeyStroke.getKeyStroke(KeyEvent.VK_DELETE, 0), "deleteNode");
-        tree.getActionMap().put("deleteNode",
-                new AbstractAction() {
-                    @Override public void actionPerformed(java.awt.event.ActionEvent e) {
-                        if (deleteBtn.isEnabled()) deleteSelected();
-                    }
-                });
+        tree.getActionMap().put("deleteNode", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent e) {
+                if (deleteBtn.isEnabled()) deleteSelected();
+            }
+        });
+
+        // Right-click context menu
+        tree.addMouseListener(new MouseAdapter() {
+            @Override public void mousePressed(MouseEvent e)  { maybeShowPopup(e); }
+            @Override public void mouseReleased(MouseEvent e) { maybeShowPopup(e); }
+        });
 
         JScrollPane scrollPane = new JScrollPane(tree);
         scrollPane.setBorder(BorderFactory.createLineBorder(
@@ -155,11 +162,9 @@ public class DirectoryTreePanel extends JPanel {
 
     public void setTreeData(DefaultMutableTreeNode root) {
         storedRoot = root;
-
-        if (root.getUserObject() instanceof FolderNode folder) {
-            cellRenderer.setReferenceSize(folder.getSize());
+        if (root.getUserObject() instanceof FolderNode f) {
+            cellRenderer.setReferenceSize(f.getSize());
         }
-
         rebuildDisplayModel();
         expandAllBtn  .setEnabled(true);
         collapseAllBtn.setEnabled(true);
@@ -168,8 +173,8 @@ public class DirectoryTreePanel extends JPanel {
     public void clear() {
         storedRoot = null;
         treeModel  = null;
-        tree.setModel(new DefaultTreeModel(
-                new DefaultMutableTreeNode("No data — select a disk and press Analyze")));
+        tree.setModel(new DefaultTreeModel(new DefaultMutableTreeNode(
+                "No data — select a disk and press Analyze")));
         expandAllBtn  .setEnabled(false);
         collapseAllBtn.setEnabled(false);
         deleteBtn     .setEnabled(false);
@@ -177,18 +182,15 @@ public class DirectoryTreePanel extends JPanel {
 
     public JTree getTree() { return tree; }
 
-    /** Register a callback that fires after each successful deletion. */
-    public void setOnDeleteCallback(Consumer<String> cb) { this.onDeleteCallback = cb; }
+    public void setOnStatusCallback(Consumer<String>  cb) { onStatusCallback  = cb; }
+    public void setOnBusyCallback  (Consumer<Boolean> cb) { onBusyCallback    = cb; }
+    /** @deprecated use {@link #setOnStatusCallback} for the final completion message. */
+    public void setOnDeleteCallback(Consumer<String>  cb) { onDeleteCallback  = cb; }
 
     // ═══════════════════════════════════════════════════════════════
-    //  Display-model rebuild  (show/hide files + sort)
+    //  Display-model rebuild
     // ═══════════════════════════════════════════════════════════════
 
-    /**
-     * Rebuilds the Swing tree model from {@code storedRoot},
-     * optionally including file leaves, then applies the current sort.
-     * Expanded paths are restored afterwards.
-     */
     private void rebuildDisplayModel() {
         if (storedRoot == null) return;
 
@@ -199,32 +201,21 @@ public class DirectoryTreePanel extends JPanel {
 
         treeModel = new DefaultTreeModel(displayRoot);
         tree.setModel(treeModel);
-
-        // Expand root row
         tree.expandRow(0);
 
-        // Restore previously expanded paths (best-effort by path string)
         for (TreePath tp : expanded) tree.expandPath(tp);
-
         updateDeleteButtonState();
     }
 
-    /**
-     * Deep-copies a sub-tree from {@code source}.
-     * File leaf nodes are included only if {@code includeFiles} is true.
-     */
-    private DefaultMutableTreeNode copyNode(DefaultMutableTreeNode source, boolean includeFiles) {
-        Object obj = source.getUserObject();
-        DefaultMutableTreeNode copy = new DefaultMutableTreeNode(obj);
-
-        for (int i = 0; i < source.getChildCount(); i++) {
-            DefaultMutableTreeNode child = (DefaultMutableTreeNode) source.getChildAt(i);
-            Object childObj = child.getUserObject();
-
-            if (childObj instanceof FileNode) {
-                if (includeFiles) copy.add(new DefaultMutableTreeNode(childObj)); // leaf
+    /** Deep-copies a sub-tree, optionally including file leaves. */
+    private DefaultMutableTreeNode copyNode(DefaultMutableTreeNode src, boolean includeFiles) {
+        DefaultMutableTreeNode copy = new DefaultMutableTreeNode(src.getUserObject());
+        for (int i = 0; i < src.getChildCount(); i++) {
+            DefaultMutableTreeNode child = (DefaultMutableTreeNode) src.getChildAt(i);
+            if (child.getUserObject() instanceof FileNode) {
+                if (includeFiles) copy.add(new DefaultMutableTreeNode(child.getUserObject()));
             } else {
-                copy.add(copyNode(child, includeFiles)); // recurse into dirs
+                copy.add(copyNode(child, includeFiles));
             }
         }
         return copy;
@@ -237,134 +228,216 @@ public class DirectoryTreePanel extends JPanel {
     private void applySort(boolean bySize) {
         this.sortBySize = bySize;
         if (storedRoot == null) return;
-
         List<TreePath> expanded = getExpandedPaths();
         sortNodes((DefaultMutableTreeNode) treeModel.getRoot(), bySize);
         treeModel.reload();
         for (TreePath tp : expanded) tree.expandPath(tp);
     }
 
-    /**
-     * Sorts children of {@code node} in-place.
-     * <ul>
-     *   <li>By size: purely descending (dirs and files interleaved).</li>
-     *   <li>By name: directories first (alphabetical), then files (alphabetical).</li>
-     * </ul>
-     */
     private void sortNodes(DefaultMutableTreeNode node, boolean bySize) {
         int count = node.getChildCount();
         if (count == 0) return;
 
         List<DefaultMutableTreeNode> children = new ArrayList<>(count);
-        for (int i = 0; i < count; i++) {
+        for (int i = 0; i < count; i++)
             children.add((DefaultMutableTreeNode) node.getChildAt(i));
-        }
 
-        Comparator<DefaultMutableTreeNode> cmp;
-        if (bySize) {
-            cmp = Comparator.comparingLong((DefaultMutableTreeNode n) -> nodeSize(n)).reversed();
-        } else {
-            // Dirs before files; within each group, alphabetical
-            cmp = Comparator
-                    .comparingInt((DefaultMutableTreeNode n) -> isFileLeaf(n) ? 1 : 0)
-                    .thenComparing(n -> nodeName(n), String.CASE_INSENSITIVE_ORDER);
-        }
+        Comparator<DefaultMutableTreeNode> cmp = bySize
+            ? Comparator.comparingLong(this::nodeSize).reversed()
+            : Comparator.comparingInt((DefaultMutableTreeNode n) -> isFileLeaf(n) ? 1 : 0)
+                        .thenComparing(this::nodeName, String.CASE_INSENSITIVE_ORDER);
 
         children.sort(cmp);
         node.removeAllChildren();
         for (DefaultMutableTreeNode child : children) {
             node.add(child);
-            if (!isFileLeaf(child)) sortNodes(child, bySize); // recurse into dirs only
+            if (!isFileLeaf(child)) sortNodes(child, bySize);
         }
     }
 
     // ═══════════════════════════════════════════════════════════════
-    //  Delete
+    //  Context menu (right-click)
+    // ═══════════════════════════════════════════════════════════════
+
+    private void maybeShowPopup(MouseEvent e) {
+        if (!e.isPopupTrigger()) return;
+
+        // Select the row under cursor before showing menu
+        TreePath pathUnderCursor = tree.getPathForLocation(e.getX(), e.getY());
+        if (pathUnderCursor == null) return;
+        tree.setSelectionPath(pathUnderCursor);
+
+        DefaultMutableTreeNode node =
+                (DefaultMutableTreeNode) pathUnderCursor.getLastPathComponent();
+        Object userObj = node.getUserObject();
+
+        JPopupMenu menu = new JPopupMenu();
+
+        // ── Skip Scan (directories only, non-root) ───────────────
+        if (userObj instanceof FolderNode folder && node.getParent() != null) {
+            String absPath = folder.getFile().getAbsolutePath();
+            boolean alreadySkipped = AppSettings.get().isSkipped(absPath);
+
+            JMenuItem skipItem = new JMenuItem(
+                    alreadySkipped ? "✓ Already in Skip List" : "⊘ Skip Scan");
+            skipItem.setEnabled(!alreadySkipped);
+            skipItem.addActionListener(ev -> {
+                AppSettings.get().addSkipPath(absPath);
+                onStatusCallback.accept(
+                        "Skip-scan added: " + absPath + "  (will take effect on next scan)");
+            });
+            menu.add(skipItem);
+            menu.addSeparator();
+        }
+
+        // ── Delete ───────────────────────────────────────────────
+        if (userObj instanceof FileSystemNode && node.getParent() != null && !deletionInProgress) {
+            JMenuItem deleteItem = new JMenuItem("🗑  Delete");
+            deleteItem.setForeground(new Color(255, 100, 80));
+            deleteItem.addActionListener(ev -> deleteSelected());
+            menu.add(deleteItem);
+        }
+
+        if (menu.getComponentCount() > 0) menu.show(tree, e.getX(), e.getY());
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Delete — runs on background SwingWorker thread
     // ═══════════════════════════════════════════════════════════════
 
     private void deleteSelected() {
-        TreePath path = tree.getSelectionPath();
-        if (path == null) return;
+        if (deletionInProgress) return;
 
-        DefaultMutableTreeNode displayNode = (DefaultMutableTreeNode) path.getLastPathComponent();
-        Object userObj = displayNode.getUserObject();
+        TreePath selPath = tree.getSelectionPath();
+        if (selPath == null) return;
 
-        // Guard: cannot delete the root
+        DefaultMutableTreeNode displayNode =
+                (DefaultMutableTreeNode) selPath.getLastPathComponent();
+
         if (displayNode.getParent() == null) {
             JOptionPane.showMessageDialog(this,
-                    "Cannot delete the root of the drive.", "Delete", JOptionPane.WARNING_MESSAGE);
+                    "Cannot delete the root of the drive.",
+                    "Delete", JOptionPane.WARNING_MESSAGE);
             return;
         }
 
-        if (!(userObj instanceof FileSystemNode fsNode)) return;
+        if (!(displayNode.getUserObject() instanceof FileSystemNode fsNode)) return;
 
-        // ── Optional confirmation ─────────────────────────────────
-        if (confirmDeletion) {
+        // ── Confirm (on EDT, before starting background work) ─────
+        if (AppSettings.get().isConfirmDeletion()) {
             String type    = fsNode.isDirectory() ? "folder" : "file";
             String sizeStr = FileSizeFormatter.format(fsNode.getSize());
+            String detail  = fsNode.isDirectory()
+                    ? "  (" + ((FolderNode) fsNode).getFileCount() + " files)" : "";
             int choice = JOptionPane.showConfirmDialog(this,
                     "<html>Permanently delete this " + type + " from disk?<br><br>"
                     + "<b>" + fsNode.getFile().getAbsolutePath() + "</b><br>"
-                    + "<i>" + sizeStr + (fsNode.isDirectory()
-                            ? "  (" + ((FolderNode) fsNode).getFileCount() + " files)" : "")
-                    + "</i></html>",
+                    + "<i>" + sizeStr + detail + "</i></html>",
                     "Confirm Deletion",
                     JOptionPane.YES_NO_OPTION,
                     JOptionPane.WARNING_MESSAGE);
             if (choice != JOptionPane.YES_OPTION) return;
         }
 
-        long deletedSize      = fsNode.getSize();
-        long deletedFileCount = fsNode.isDirectory()
-                ? ((FolderNode) fsNode).getFileCount() : 1;
+        // ── Snapshot what we're about to delete ───────────────────
+        final long        deletedSize  = fsNode.getSize();
+        final long        deletedFiles = fsNode.isDirectory()
+                ? ((FolderNode) fsNode).getFileCount() : 1L;
+        final Path        targetPath   = fsNode.getFile().toPath();
+        final String      targetLabel  = fsNode.getFile().getAbsolutePath();
+        final Object      userObj      = fsNode;  // identity ref into storedRoot
 
-        // ── Delete from filesystem ────────────────────────────────
-        try {
-            deleteFromDisk(fsNode.getFile().toPath());
-        } catch (IOException ex) {
-            JOptionPane.showMessageDialog(this,
-                    "Delete failed:\n" + ex.getMessage(),
-                    "Error", JOptionPane.ERROR_MESSAGE);
-            return;
-        }
+        // ── Disable UI while deleting ─────────────────────────────
+        setDeletionBusy(true);
+        onStatusCallback.accept("Deleting: " + targetLabel + " …");
 
-        // ── Update storedRoot ancestor sizes ──────────────────────
-        DefaultMutableTreeNode storedNode = findInTree(storedRoot, userObj);
-        if (storedNode != null) {
-            adjustAncestorSizes(storedNode, deletedSize, deletedFileCount);
-            storedNode.removeFromParent();
-        }
+        // ── Background worker ─────────────────────────────────────
+        SwingWorker<Void, String> worker = new SwingWorker<>() {
 
-        // ── Rebuild display ───────────────────────────────────────
-        rebuildDisplayModel();
+            private final AtomicLong deletedCount = new AtomicLong(0);
+            private       String     errorMsg     = null;
 
-        String msg = "Deleted: " + fsNode.getFile().getAbsolutePath()
-                + "  (" + FileSizeFormatter.format(deletedSize) + ")";
-        onDeleteCallback.accept(msg);
-    }
-
-    /** Deletes a file or recursively deletes a directory. */
-    private void deleteFromDisk(Path target) throws IOException {
-        if (Files.isDirectory(target)) {
-            try (var walk = Files.walk(target)) {
-                walk.sorted(Comparator.reverseOrder())
-                    .forEach(p -> {
-                        try { Files.delete(p); }
-                        catch (IOException e) { throw new UncheckedIOException(e); }
-                    });
-            } catch (UncheckedIOException e) {
-                throw e.getCause();
+            @Override
+            protected Void doInBackground() {
+                try {
+                    if (Files.isDirectory(targetPath)) {
+                        try (var walk = Files.walk(targetPath)) {
+                            walk.sorted(Comparator.reverseOrder())
+                                .forEach(p -> {
+                                    try {
+                                        Files.delete(p);
+                                        long n = deletedCount.incrementAndGet();
+                                        if (n % 100 == 0) {
+                                            publish("Deleting: " + n + " items removed …");
+                                        }
+                                    } catch (IOException ex) {
+                                        throw new UncheckedIOException(ex);
+                                    }
+                                });
+                        } catch (UncheckedIOException ex) {
+                            throw ex.getCause();
+                        }
+                    } else {
+                        Files.delete(targetPath);
+                        deletedCount.set(1);
+                    }
+                } catch (IOException ex) {
+                    errorMsg = ex.getMessage();
+                }
+                return null;
             }
-        } else {
-            Files.delete(target);
-        }
+
+            @Override
+            protected void process(List<String> chunks) {
+                if (!chunks.isEmpty()) onStatusCallback.accept(chunks.get(chunks.size() - 1));
+            }
+
+            @Override
+            protected void done() {
+                setDeletionBusy(false);
+
+                if (errorMsg != null) {
+                    onStatusCallback.accept("Delete failed: " + errorMsg);
+                    JOptionPane.showMessageDialog(DirectoryTreePanel.this,
+                            "Delete failed:\n" + errorMsg,
+                            "Error", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+
+                // ── Update storedRoot in-place (no rescan) ────────
+                DefaultMutableTreeNode storedNode = findInTree(storedRoot, userObj);
+                if (storedNode != null) {
+                    adjustAncestorSizes(storedNode, deletedSize, deletedFiles);
+                    storedNode.removeFromParent();
+                }
+
+                rebuildDisplayModel();
+
+                String msg = "Deleted " + deletedCount.get() + " items  —  "
+                        + FileSizeFormatter.format(deletedSize) + " freed  ("
+                        + targetLabel + ")";
+                onStatusCallback.accept(msg);
+                onDeleteCallback.accept(msg);
+            }
+        };
+
+        worker.execute();
     }
 
-    /**
-     * Walks up the ancestor chain of {@code node} in the storedRoot tree,
-     * subtracting {@code sizeToRemove} and {@code fileCountToRemove} from each
-     * ancestor {@link FolderNode}.
-     */
+    /** Enables/disables controls that must not be used during deletion. */
+    private void setDeletionBusy(boolean busy) {
+        deletionInProgress = busy;
+        deleteBtn     .setEnabled(!busy);
+        sortBySizeBtn .setEnabled(!busy);
+        sortByNameBtn .setEnabled(!busy);
+        showFilesChk  .setEnabled(!busy);
+        onBusyCallback.accept(busy);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Tree helpers
+    // ═══════════════════════════════════════════════════════════════
+
     private void adjustAncestorSizes(DefaultMutableTreeNode node,
                                      long sizeToRemove, long fileCountToRemove) {
         DefaultMutableTreeNode parent = (DefaultMutableTreeNode) node.getParent();
@@ -377,10 +450,6 @@ public class DirectoryTreePanel extends JPanel {
         }
     }
 
-    /**
-     * Finds the first node in {@code root}'s subtree whose user-object is
-     * {@code == target} (identity comparison, since we share references).
-     */
     private DefaultMutableTreeNode findInTree(DefaultMutableTreeNode root, Object target) {
         if (root.getUserObject() == target) return root;
         for (int i = 0; i < root.getChildCount(); i++) {
@@ -391,28 +460,22 @@ public class DirectoryTreePanel extends JPanel {
         return null;
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    //  Helpers
-    // ═══════════════════════════════════════════════════════════════
-
     private void updateDeleteButtonState() {
-        if (storedRoot == null) { deleteBtn.setEnabled(false); return; }
+        if (storedRoot == null || deletionInProgress) { deleteBtn.setEnabled(false); return; }
         TreePath sel = tree.getSelectionPath();
         if (sel == null) { deleteBtn.setEnabled(false); return; }
         DefaultMutableTreeNode node = (DefaultMutableTreeNode) sel.getLastPathComponent();
-        // Disable for the root drive node
         deleteBtn.setEnabled(node.getParent() != null
                 && node.getUserObject() instanceof FileSystemNode);
     }
 
     private long nodeSize(DefaultMutableTreeNode n) {
-        Object obj = n.getUserObject();
-        return (obj instanceof FileSystemNode fsn) ? fsn.getSize() : 0L;
+        return (n.getUserObject() instanceof FileSystemNode fsn) ? fsn.getSize() : 0L;
     }
 
     private String nodeName(DefaultMutableTreeNode n) {
-        Object obj = n.getUserObject();
-        return (obj instanceof FileSystemNode fsn) ? fsn.getName() : obj.toString();
+        return (n.getUserObject() instanceof FileSystemNode fsn)
+                ? fsn.getName() : n.getUserObject().toString();
     }
 
     private boolean isFileLeaf(DefaultMutableTreeNode n) {
@@ -436,10 +499,9 @@ public class DirectoryTreePanel extends JPanel {
         for (int i = tree.getRowCount() - 1; i > 0; i--) tree.collapseRow(i);
     }
 
-    private static JSeparator separator() {
+    private static JSeparator sep() {
         JSeparator s = new JSeparator(SwingConstants.VERTICAL);
         s.setPreferredSize(new Dimension(1, 20));
         return s;
     }
 }
-

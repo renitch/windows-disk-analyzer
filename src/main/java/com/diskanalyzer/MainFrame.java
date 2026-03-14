@@ -5,6 +5,7 @@ import com.diskanalyzer.model.FileNode;
 import com.diskanalyzer.model.FolderNode;
 import com.diskanalyzer.ui.DirectoryTreePanel;
 import com.diskanalyzer.ui.PieChartPanel;
+import com.diskanalyzer.ui.SettingsDialog;
 import com.diskanalyzer.util.FileSizeFormatter;
 
 import javax.swing.*;
@@ -88,6 +89,12 @@ public class MainFrame extends JFrame {
         cancelBtn.addActionListener(e -> cancelAnalysis());
         left.add(cancelBtn);
 
+        JButton settingsBtn = new JButton("⚙  Settings");
+        settingsBtn.setPreferredSize(new Dimension(115, 30));
+        settingsBtn.addActionListener(e ->
+                new SettingsDialog(this).setVisible(true));
+        left.add(settingsBtn);
+
         // Right: disk usage bar
         diskInfoLabel = new JLabel();
         diskInfoLabel.setFont(diskInfoLabel.getFont().deriveFont(12f));
@@ -103,8 +110,19 @@ public class MainFrame extends JFrame {
         treePanel  = new DirectoryTreePanel();
         chartPanel = new PieChartPanel();
 
-        // Delete callback → status bar
-        treePanel.setOnDeleteCallback(msg -> statusLabel.setText(msg));
+        // Status bar messages from deletion progress
+        treePanel.setOnStatusCallback(msg ->
+                SwingUtilities.invokeLater(() -> statusLabel.setText(msg)));
+
+        // Show/hide progress bar during deletion
+        treePanel.setOnBusyCallback(busy -> SwingUtilities.invokeLater(() -> {
+            progressBar.setVisible(busy);
+            progressBar.setIndeterminate(busy);
+            analyzeBtn.setEnabled(!busy);
+        }));
+
+        // Legacy callback (no-op, status handles it)
+        treePanel.setOnDeleteCallback(msg -> {});
 
         // Selection → status bar info
         treePanel.getTree().addTreeSelectionListener(e -> {
@@ -165,8 +183,10 @@ public class MainFrame extends JFrame {
 
         statusLabel.setText("Scanning " + selectedDisk.getAbsolutePath() + " …");
 
-        currentWorker = new DiskAnalyzerWorker(selectedDisk, msg ->
-                SwingUtilities.invokeLater(() -> statusLabel.setText(msg)));
+        currentWorker = new DiskAnalyzerWorker(
+                selectedDisk,
+                msg -> SwingUtilities.invokeLater(() -> statusLabel.setText(msg)),
+                AppSettings.get().getSkipPaths());
 
         currentWorker.addPropertyChangeListener(evt -> {
             if ("state".equals(evt.getPropertyName())

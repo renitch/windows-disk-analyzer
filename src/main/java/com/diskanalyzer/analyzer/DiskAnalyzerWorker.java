@@ -7,11 +7,7 @@ import javax.swing.*;
 import javax.swing.tree.DefaultMutableTreeNode;
 import java.io.File;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
@@ -20,14 +16,18 @@ public class DiskAnalyzerWorker extends SwingWorker<DefaultMutableTreeNode, Stri
 
     private final File rootFile;
     private final Consumer<String> progressConsumer;
-    private final AtomicBoolean stopFlag  = new AtomicBoolean(false);
-    private final AtomicLong scannedDirs  = new AtomicLong(0);
-    // Track canonical paths to prevent symlink infinite loops
+    private final Set<String>      skipPaths;          // canonical paths to skip
+    private final AtomicBoolean    stopFlag  = new AtomicBoolean(false);
+    private final AtomicLong       scannedDirs = new AtomicLong(0);
+    // Tracks visited canonical paths to prevent symlink infinite loops
     private final Set<String> visitedPaths = new HashSet<>();
 
-    public DiskAnalyzerWorker(File rootFile, Consumer<String> progressConsumer) {
-        this.rootFile = rootFile;
+    public DiskAnalyzerWorker(File rootFile,
+                               Consumer<String> progressConsumer,
+                               Set<String> skipPaths) {
+        this.rootFile         = rootFile;
         this.progressConsumer = progressConsumer;
+        this.skipPaths        = skipPaths == null ? Collections.emptySet() : skipPaths;
     }
 
     @Override
@@ -51,13 +51,15 @@ public class DiskAnalyzerWorker extends SwingWorker<DefaultMutableTreeNode, Stri
      *   <li>Sub-directory nodes (sorted by total size desc)</li>
      *   <li>Direct file leaf nodes (sorted by size desc)</li>
      * </ol>
-     * @return long[2]: [0] = total bytes (dirs + files), [1] = total file count
+     * Directories whose canonical path is in {@code skipPaths} are silently skipped.
+     *
+     * @return long[2]: [0] = total bytes, [1] = total file count
      */
     private long[] scanDirectory(File dir, DefaultMutableTreeNode parentNode) {
         if (stopFlag.get() || isCancelled()) return new long[]{0, 0};
 
         File[] entries = dir.listFiles();
-        if (entries == null) return new long[]{0, 0}; // no access
+        if (entries == null) return new long[]{0, 0};
 
         long totalBytes = 0;
         long totalFiles = 0;
@@ -69,11 +71,17 @@ public class DiskAnalyzerWorker extends SwingWorker<DefaultMutableTreeNode, Stri
             if (stopFlag.get() || isCancelled()) break;
 
             if (entry.isDirectory()) {
-                // Symlink guard
+                String canonical;
                 try {
-                    String canonical = entry.getCanonicalPath();
-                    if (!visitedPaths.add(canonical)) continue;
+                    canonical = entry.getCanonicalPath();
+                    if (!visitedPaths.add(canonical)) continue; // symlink loop guard
                 } catch (IOException ignored) { continue; }
+
+                // ── Skip-scan check ───────────────────────────────
+                if (skipPaths.contains(canonical) || skipPaths.contains(entry.getAbsolutePath())) {
+                    publish("Skipping: " + entry.getAbsolutePath());
+                    continue;
+                }
 
                 FolderNode childFolder = new FolderNode(entry);
                 DefaultMutableTreeNode childNode = new DefaultMutableTreeNode(childFolder);
@@ -98,7 +106,7 @@ public class DiskAnalyzerWorker extends SwingWorker<DefaultMutableTreeNode, Stri
             }
         }
 
-        // ── Sub-directory nodes (largest first) ───────────────────
+        // Sub-directory nodes — largest first
         dirNodes.sort((a, b) -> {
             FolderNode fa = (FolderNode) a.getUserObject();
             FolderNode fb = (FolderNode) b.getUserObject();
@@ -106,7 +114,7 @@ public class DiskAnalyzerWorker extends SwingWorker<DefaultMutableTreeNode, Stri
         });
         for (DefaultMutableTreeNode dn : dirNodes) parentNode.add(dn);
 
-        // ── File leaf nodes (largest first) ───────────────────────
+        // File leaf nodes — largest first
         fileList.sort(Comparator.comparingLong(File::length).reversed());
         for (File f : fileList) {
             parentNode.add(new DefaultMutableTreeNode(new FileNode(f)));
