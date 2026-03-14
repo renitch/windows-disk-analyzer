@@ -4,6 +4,7 @@ import com.diskanalyzer.AppSettings;
 import com.diskanalyzer.model.FileNode;
 import com.diskanalyzer.model.FileSystemNode;
 import com.diskanalyzer.model.FolderNode;
+import com.diskanalyzer.util.ElevatedDeleteHelper;
 import com.diskanalyzer.util.FileSizeFormatter;
 
 import javax.swing.*;
@@ -398,26 +399,13 @@ public class DirectoryTreePanel extends JPanel {
 
                 if (errorMsg != null) {
                     onStatusCallback.accept("Delete failed: " + errorMsg);
-                    JOptionPane.showMessageDialog(DirectoryTreePanel.this,
-                            "Delete failed:\n" + errorMsg,
-                            "Error", JOptionPane.ERROR_MESSAGE);
+                    offerElevatedDelete(targetPath, targetLabel,
+                                        deletedSize, deletedFiles, userObj, errorMsg);
                     return;
                 }
 
-                // ── Update storedRoot in-place (no rescan) ────────
-                DefaultMutableTreeNode storedNode = findInTree(storedRoot, userObj);
-                if (storedNode != null) {
-                    adjustAncestorSizes(storedNode, deletedSize, deletedFiles);
-                    storedNode.removeFromParent();
-                }
-
-                rebuildDisplayModel();
-
-                String msg = "Deleted " + deletedCount.get() + " items  —  "
-                        + FileSizeFormatter.format(deletedSize) + " freed  ("
-                        + targetLabel + ")";
-                onStatusCallback.accept(msg);
-                onDeleteCallback.accept(msg);
+                finaliseDeletedNode(userObj, deletedSize, deletedFiles,
+                                    deletedCount.get(), targetLabel);
             }
         };
 
@@ -432,6 +420,136 @@ public class DirectoryTreePanel extends JPanel {
         sortByNameBtn .setEnabled(!busy);
         showFilesChk  .setEnabled(!busy);
         onBusyCallback.accept(busy);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Elevated-privilege retry
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * Called on the EDT after a normal deletion fails.
+     * Shows a dialog asking whether to retry with admin/root privileges.
+     * If confirmed, launches a new background SwingWorker that uses
+     * {@link ElevatedDeleteHelper}.
+     */
+    private void offerElevatedDelete(Path targetPath, String targetLabel,
+                                     long deletedSize, long deletedFiles,
+                                     Object userObj, String originalError) {
+        String osNote = switch (ElevatedDeleteHelper.detectOS()) {
+            case WINDOWS -> "A UAC (User Account Control) prompt will appear.";
+            case MAC     -> "You will be prompted for your administrator password.";
+            case LINUX   -> "A graphical privilege dialog (pkexec / gksudo) will appear.";
+            default      -> "The OS will request elevated permissions.";
+        };
+
+        int choice = JOptionPane.showConfirmDialog(
+                DirectoryTreePanel.this,
+                "<html>"
+                + "<b>Deletion failed:</b><br>"
+                + "<i>" + escapeHtml(originalError) + "</i>"
+                + "<br><br>"
+                + "This may be a permissions issue.<br>"
+                + "Would you like to retry with <b>administrator privileges</b>?<br><br>"
+                + "<small>" + osNote + "</small>"
+                + "</html>",
+                "Retry with Elevated Privileges",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE);
+
+        if (choice != JOptionPane.YES_OPTION) return;
+
+        runElevatedDelete(targetPath, targetLabel, deletedSize, deletedFiles, userObj);
+    }
+
+    /**
+     * Runs {@link ElevatedDeleteHelper#delete} on a background thread,
+     * streaming status updates, then finalises the tree on success.
+     */
+    private void runElevatedDelete(Path targetPath, String targetLabel,
+                                   long deletedSize, long deletedFiles, Object userObj) {
+        setDeletionBusy(true);
+        onStatusCallback.accept("Requesting elevated privileges …");
+
+        SwingWorker<ElevatedDeleteHelper.Result, String> elevWorker = new SwingWorker<>() {
+
+            @Override
+            protected ElevatedDeleteHelper.Result doInBackground() {
+                return ElevatedDeleteHelper.delete(targetPath,
+                        msg -> publish(msg));
+            }
+
+            @Override
+            protected void process(List<String> chunks) {
+                if (!chunks.isEmpty())
+                    onStatusCallback.accept(chunks.get(chunks.size() - 1));
+            }
+
+            @Override
+            protected void done() {
+                setDeletionBusy(false);
+                ElevatedDeleteHelper.Result result;
+                try {
+                    result = get();
+                } catch (Exception ex) {
+                    onStatusCallback.accept("Elevated delete failed: " + ex.getMessage());
+                    JOptionPane.showMessageDialog(DirectoryTreePanel.this,
+                            "Elevated deletion encountered an unexpected error:\n"
+                            + ex.getMessage(),
+                            "Error", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+
+                if (!result.success()) {
+                    onStatusCallback.accept("Elevated delete failed: " + result.errorMessage());
+                    JOptionPane.showMessageDialog(DirectoryTreePanel.this,
+                            "<html><b>Elevated deletion failed:</b><br>"
+                            + escapeHtml(result.errorMessage()) + "</html>",
+                            "Delete Failed", JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+
+                // Success — update tree exactly as with a regular delete
+                finaliseDeletedNode(userObj, deletedSize, deletedFiles, -1L, targetLabel);
+            }
+        };
+
+        elevWorker.execute();
+    }
+
+    /**
+     * Updates the in-memory tree model after a successful deletion
+     * (regular or elevated) and fires status callbacks.
+     *
+     * @param itemCount negative means "unknown" (elevated process gives no file count)
+     */
+    private void finaliseDeletedNode(Object userObj, long deletedSize,
+                                     long deletedFiles, long itemCount, String targetLabel) {
+        DefaultMutableTreeNode storedNode = findInTree(storedRoot, userObj);
+        if (storedNode != null) {
+            adjustAncestorSizes(storedNode, deletedSize, deletedFiles);
+            storedNode.removeFromParent();
+        }
+
+        rebuildDisplayModel();
+
+        String countPart = itemCount >= 0
+                ? itemCount + " items  —  "
+                : "";
+        String msg = "Deleted " + countPart
+                + FileSizeFormatter.format(deletedSize) + " freed  ("
+                + targetLabel + ")";
+        onStatusCallback.accept(msg);
+        onDeleteCallback.accept(msg);
+    }
+
+    /** Minimal HTML escaping for use inside JOptionPane HTML strings. */
+    private static String escapeHtml(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;")
+                .replace("\n", "<br>");
     }
 
     // ═══════════════════════════════════════════════════════════════
