@@ -172,59 +172,121 @@ public class DirectoryTreePanel extends JPanel {
     //  Public API
     // ═══════════════════════════════════════════════════════════════
 
+    /**
+     * Loads a new scan result.
+     * <p>
+     * Strategy (keeps the checkbox always active):
+     * <ol>
+     *   <li>{@code modelWithoutFiles} (dirs only) is built <em>synchronously</em> on
+     *       the EDT — it skips all {@link FileNode} leaves so it is small and instant.</li>
+     *   <li>All controls including "Show Files" are enabled right away.</li>
+     *   <li>{@code modelWithFiles} (dirs + files) is built on a background thread
+     *       since it includes every file leaf and can be large on big drives.</li>
+     *   <li>If the user ticks "Show Files" while the background build is still running,
+     *       the flag is recorded and the switch happens automatically in {@code done()}.</li>
+     * </ol>
+     */
     public void setTreeData(DefaultMutableTreeNode root) {
-        storedRoot    = root;
-        modelsReady   = false;
+        storedRoot        = root;
         modelWithFiles    = null;
         modelWithoutFiles = null;
+        modelsReady       = false;
 
         if (root.getUserObject() instanceof FolderNode f) {
             cellRenderer.setReferenceSize(f.getSize());
         }
 
-        // Temporarily show root-only placeholder while building in background
-        treeModel = new DefaultTreeModel(new DefaultMutableTreeNode("Building tree…"));
+        // Show a lightweight placeholder while the worker starts
+        treeModel = new DefaultTreeModel(new DefaultMutableTreeNode("Preparing tree…"));
         tree.setModel(treeModel);
-        showFilesChk.setEnabled(false);
-        sortBySizeBtn.setEnabled(false);
-        sortByNameBtn.setEnabled(false);
-        expandAllBtn .setEnabled(false);
-        collapseAllBtn.setEnabled(false);
-        onStatusCallback.accept("Building display model…");
 
-        // Build both pre-sorted display models off the EDT
-        SwingWorker<Void, Void> builder = new SwingWorker<>() {
-            private DefaultTreeModel builtWithFiles;
-            private DefaultTreeModel builtWithoutFiles;
+        launchModelBuilder(root, true /* activate when dirs-only is ready */);
+    }
+
+    /**
+     * Builds both display models entirely off the EDT using a single worker.
+     *
+     * <p><b>Phase 1</b> (background): copy + sort the dirs-only tree, then call
+     * {@link SwingWorker#publish} — this delivers the model to {@link #process}
+     * on the EDT which immediately shows the tree and <em>enables the checkbox</em>.
+     *
+     * <p><b>Phase 2</b> (background, continues): copy + sort the with-files tree,
+     * returned via {@link SwingWorker#get()} in {@link #done}.
+     *
+     * <p>The checkbox is always enabled once Phase 1 completes, regardless of
+     * whether Phase 2 succeeds.
+     *
+     * @param root            source tree (storedRoot)
+     * @param activateOnPhase1 if true, switch the live view to the dirs model in process()
+     */
+    private void launchModelBuilder(DefaultMutableTreeNode root, boolean activateOnPhase1) {
+        // Capture expanded paths before launching (may be empty for initial load)
+        final List<TreePath> expandedSnapshot = getExpandedPaths();
+
+        SwingWorker<DefaultTreeModel, DefaultTreeModel> worker =
+                new SwingWorker<DefaultTreeModel, DefaultTreeModel>() {
 
             @Override
-            protected Void doInBackground() {
-                DefaultMutableTreeNode withFiles    = copyNode(root, true);
-                DefaultMutableTreeNode withoutFiles = copyNode(root, false);
-                sortNodes(withFiles,    sortBySize);
-                sortNodes(withoutFiles, sortBySize);
-                builtWithFiles    = new DefaultTreeModel(withFiles);
-                builtWithoutFiles = new DefaultTreeModel(withoutFiles);
-                return null;
+            protected DefaultTreeModel doInBackground() {
+                // ── Phase 1: dirs-only (fast — no file leaves) ───────
+                DefaultMutableTreeNode dirsRoot = copyNode(root, false);
+                sortNodes(dirsRoot, sortBySize);
+                publish(new DefaultTreeModel(dirsRoot));   // → process() on EDT
+
+                // ── Phase 2: with files (slower on large drives) ──────
+                DefaultMutableTreeNode filesRoot = copyNode(root, true);
+                sortNodes(filesRoot, sortBySize);
+                return new DefaultTreeModel(filesRoot);    // → done() via get()
             }
 
             @Override
-            protected void done() {
-                modelWithFiles    = builtWithFiles;
-                modelWithoutFiles = builtWithoutFiles;
-                modelsReady = true;
+            protected void process(List<DefaultTreeModel> chunks) {
+                // Called on EDT once Phase 1 is done — enable everything NOW
+                modelWithoutFiles = chunks.get(chunks.size() - 1);
 
+                if (activateOnPhase1 && !showFiles) {
+                    treeModel = modelWithoutFiles;
+                    tree.setModel(treeModel);
+                    tree.expandRow(0);
+                    for (TreePath tp : expandedSnapshot) tree.expandPath(tp);
+                    updateDeleteButtonState();
+                }
+
+                // Checkbox active from this moment regardless of Phase 2 outcome
                 showFilesChk  .setEnabled(true);
                 sortBySizeBtn .setEnabled(true);
                 sortByNameBtn .setEnabled(true);
                 expandAllBtn  .setEnabled(true);
                 collapseAllBtn.setEnabled(true);
+            }
 
-                activateModel(showFiles);
-                onStatusCallback.accept("Ready.");
+            @Override
+            protected void done() {
+                try {
+                    modelWithFiles = get();
+                } catch (Exception ex) {
+                    // Phase 2 failed — dirs model still works, checkbox stays enabled
+                    onStatusCallback.accept(
+                            "Note: file list could not be fully built — " + ex.getMessage());
+                    // Do NOT disable the checkbox — dirs-only mode still functions
+                    return;
+                }
+
+                modelsReady = true;
+
+                // Auto-switch if the user already ticked "Show Files" during Phase 2
+                if (showFiles) {
+                    List<TreePath> expanded = getExpandedPaths();
+                    treeModel = modelWithFiles;
+                    tree.setModel(treeModel);
+                    tree.expandRow(0);
+                    for (TreePath tp : expanded) tree.expandPath(tp);
+                    updateDeleteButtonState();
+                }
             }
         };
-        builder.execute();
+
+        worker.execute();
     }
 
     public void clear() {
@@ -239,6 +301,7 @@ public class DirectoryTreePanel extends JPanel {
         collapseAllBtn.setEnabled(false);
         deleteBtn     .setEnabled(false);
         showFilesChk  .setEnabled(false);
+        showFilesChk  .setToolTipText("Include individual files in the directory tree");
         sortBySizeBtn .setEnabled(false);
         sortByNameBtn .setEnabled(false);
     }
@@ -254,62 +317,48 @@ public class DirectoryTreePanel extends JPanel {
     // ═══════════════════════════════════════════════════════════════
 
     /**
-     * Instantly swaps to the correct pre-built model. O(1) on the EDT.
-     * Restored expanded paths are matched by user-object identity.
+     * Swaps to the correct pre-built model.
+     * <ul>
+     *   <li>Toggling to "without files" is always instant — that model is always ready.</li>
+     *   <li>Toggling to "with files" is instant once the background build finishes;
+     *       before that, the flag is recorded and the switch happens in
+     *       {@link #buildFilesModelAsync}'s {@code done()}.</li>
+     * </ul>
      */
     private void activateModel(boolean withFiles) {
-        if (!modelsReady) return;
+        if (withFiles && !modelsReady) {
+            // Files model is still being built in the background.
+            // The intent is recorded (showFiles=true) and will be applied automatically
+            // in launchModelBuilder's done() when Phase 2 finishes.
+            onStatusCallback.accept("Building file list in background — tree will update automatically…");
+            return;
+        }
+
+        DefaultTreeModel target = withFiles ? modelWithFiles : modelWithoutFiles;
+        if (target == null) return;
 
         List<TreePath> expanded = getExpandedPaths();
-
-        treeModel = withFiles ? modelWithFiles : modelWithoutFiles;
+        treeModel = target;
         tree.setModel(treeModel);
         tree.expandRow(0);
-
-        // Best-effort restore of expanded paths
         for (TreePath tp : expanded) tree.expandPath(tp);
         updateDeleteButtonState();
     }
 
     /**
-     * Rebuilds both pre-built models in the background (called after deletion
-     * to keep them in sync with storedRoot). Re-applies the active view on completion.
+     * Rebuilds both models after a deletion, then restores the active view.
+     * Called from the deletion worker's {@code done()} (already off-EDT concerns handled).
+     * Uses {@link #launchModelBuilder} so the dirs model is published to the EDT
+     * quickly and controls are re-enabled as soon as possible.
      */
     private void rebuildDisplayModel() {
         if (storedRoot == null) return;
-        modelsReady = false;
 
-        List<TreePath> expanded = getExpandedPaths();
+        modelWithFiles    = null;
+        modelWithoutFiles = null;
+        modelsReady       = false;
 
-        SwingWorker<Void, Void> builder = new SwingWorker<>() {
-            private DefaultTreeModel builtWithFiles;
-            private DefaultTreeModel builtWithoutFiles;
-
-            @Override
-            protected Void doInBackground() {
-                DefaultMutableTreeNode withFiles    = copyNode(storedRoot, true);
-                DefaultMutableTreeNode withoutFiles = copyNode(storedRoot, false);
-                sortNodes(withFiles,    sortBySize);
-                sortNodes(withoutFiles, sortBySize);
-                builtWithFiles    = new DefaultTreeModel(withFiles);
-                builtWithoutFiles = new DefaultTreeModel(withoutFiles);
-                return null;
-            }
-
-            @Override
-            protected void done() {
-                modelWithFiles    = builtWithFiles;
-                modelWithoutFiles = builtWithoutFiles;
-                modelsReady = true;
-
-                treeModel = showFiles ? modelWithFiles : modelWithoutFiles;
-                tree.setModel(treeModel);
-                tree.expandRow(0);
-                for (TreePath tp : expanded) tree.expandPath(tp);
-                updateDeleteButtonState();
-            }
-        };
-        builder.execute();
+        launchModelBuilder(storedRoot, true);
     }
 
     /** Deep-copies a sub-tree node, including or excluding FileNode leaves. */
@@ -332,18 +381,25 @@ public class DirectoryTreePanel extends JPanel {
 
     private void applySort(boolean bySize) {
         this.sortBySize = bySize;
-        if (storedRoot == null || !modelsReady) return;
+        if (storedRoot == null) return;
 
         List<TreePath> expanded = getExpandedPaths();
 
-        // Re-sort both pre-built models in-place (fast, no deep copy)
-        sortNodes((DefaultMutableTreeNode) modelWithFiles   .getRoot(), bySize);
-        sortNodes((DefaultMutableTreeNode) modelWithoutFiles.getRoot(), bySize);
-        modelWithFiles   .reload();
-        modelWithoutFiles.reload();
+        // Always re-sort the dirs-only model (always available)
+        if (modelWithoutFiles != null) {
+            sortNodes((DefaultMutableTreeNode) modelWithoutFiles.getRoot(), bySize);
+            modelWithoutFiles.reload();
+        }
 
-        // Reattach the currently active one
-        treeModel = showFiles ? modelWithFiles : modelWithoutFiles;
+        // Re-sort the files model only if it has been built
+        if (modelWithFiles != null) {
+            sortNodes((DefaultMutableTreeNode) modelWithFiles.getRoot(), bySize);
+            modelWithFiles.reload();
+        }
+
+        // Re-attach the currently active model
+        treeModel = (showFiles && modelWithFiles != null) ? modelWithFiles : modelWithoutFiles;
+        if (treeModel == null) return;
         tree.setModel(treeModel);
         tree.expandRow(0);
         for (TreePath tp : expanded) tree.expandPath(tp);
