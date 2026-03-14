@@ -1,6 +1,8 @@
 package com.diskanalyzer.ui;
 
+import com.diskanalyzer.model.FileNode;
 import com.diskanalyzer.model.FolderNode;
+import com.diskanalyzer.model.FileSystemNode;
 import com.diskanalyzer.util.FileSizeFormatter;
 import org.jfree.chart.ChartFactory;
 import org.jfree.chart.ChartPanel;
@@ -62,11 +64,13 @@ public class PieChartPanel extends JPanel {
         FolderNode rootFolder = (FolderNode) rootNode.getUserObject();
         long rootSize = rootFolder.getSize();
 
-        // Collect and sort direct children
+        // Collect only sub-directory children (FileNode leaves are ignored for the pie)
         List<FolderNode> children = new ArrayList<>();
         for (int i = 0; i < rootNode.getChildCount(); i++) {
             DefaultMutableTreeNode child = (DefaultMutableTreeNode) rootNode.getChildAt(i);
-            children.add((FolderNode) child.getUserObject());
+            if (child.getUserObject() instanceof FolderNode fn) {
+                children.add(fn);
+            }
         }
         children.sort(Comparator.comparingLong(FolderNode::getSize).reversed());
 
