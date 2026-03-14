@@ -33,13 +33,21 @@ public class DirectoryTreePanel extends JPanel {
     private SizeTreeCellRenderer     cellRenderer;
 
     // ── Data ─────────────────────────────────────────────────────────
-    /** Full scanned tree (dirs + files) — source of truth; display model is a filtered copy. */
+    /** Full scanned tree (dirs + files) — never rendered directly; source of truth. */
     private DefaultMutableTreeNode storedRoot;
+
+    /**
+     * Two pre-built, pre-sorted display models built once from storedRoot.
+     * Toggling show/hide files just swaps which model is active — zero deep-copy on the EDT.
+     */
+    private DefaultTreeModel modelWithoutFiles;   // dirs only
+    private DefaultTreeModel modelWithFiles;      // dirs + file leaves
 
     // ── State ────────────────────────────────────────────────────────
     private boolean sortBySize = true;
     private boolean showFiles  = false;
-    private boolean deletionInProgress = false;
+    private boolean deletionInProgress  = false;
+    private boolean modelsReady         = false;   // true once background build finishes
 
     // ── Toolbar controls ─────────────────────────────────────────────
     private JToggleButton sortBySizeBtn;
@@ -79,6 +87,8 @@ public class DirectoryTreePanel extends JPanel {
         sortByNameBtn = new JToggleButton("By Name", false);
         sortGroup.add(sortBySizeBtn);
         sortGroup.add(sortByNameBtn);
+        sortBySizeBtn.setEnabled(false);
+        sortByNameBtn.setEnabled(false);
         sortBySizeBtn.addActionListener(e -> applySort(true));
         sortByNameBtn.addActionListener(e -> applySort(false));
 
@@ -101,9 +111,10 @@ public class DirectoryTreePanel extends JPanel {
 
         showFilesChk = new JCheckBox("Show Files", showFiles);
         showFilesChk.setToolTipText("Include individual files in the directory tree");
+        showFilesChk.setEnabled(false);   // enabled once models are ready
         showFilesChk.addActionListener(e -> {
             showFiles = showFilesChk.isSelected();
-            rebuildDisplayModel();
+            activateModel(showFiles);  // O(1) model swap — no deep copy, no freeze
         });
 
         deleteBtn = new JButton("🗑  Delete");
@@ -162,53 +173,146 @@ public class DirectoryTreePanel extends JPanel {
     // ═══════════════════════════════════════════════════════════════
 
     public void setTreeData(DefaultMutableTreeNode root) {
-        storedRoot = root;
+        storedRoot    = root;
+        modelsReady   = false;
+        modelWithFiles    = null;
+        modelWithoutFiles = null;
+
         if (root.getUserObject() instanceof FolderNode f) {
             cellRenderer.setReferenceSize(f.getSize());
         }
-        rebuildDisplayModel();
-        expandAllBtn  .setEnabled(true);
-        collapseAllBtn.setEnabled(true);
+
+        // Temporarily show root-only placeholder while building in background
+        treeModel = new DefaultTreeModel(new DefaultMutableTreeNode("Building tree…"));
+        tree.setModel(treeModel);
+        showFilesChk.setEnabled(false);
+        sortBySizeBtn.setEnabled(false);
+        sortByNameBtn.setEnabled(false);
+        expandAllBtn .setEnabled(false);
+        collapseAllBtn.setEnabled(false);
+        onStatusCallback.accept("Building display model…");
+
+        // Build both pre-sorted display models off the EDT
+        SwingWorker<Void, Void> builder = new SwingWorker<>() {
+            private DefaultTreeModel builtWithFiles;
+            private DefaultTreeModel builtWithoutFiles;
+
+            @Override
+            protected Void doInBackground() {
+                DefaultMutableTreeNode withFiles    = copyNode(root, true);
+                DefaultMutableTreeNode withoutFiles = copyNode(root, false);
+                sortNodes(withFiles,    sortBySize);
+                sortNodes(withoutFiles, sortBySize);
+                builtWithFiles    = new DefaultTreeModel(withFiles);
+                builtWithoutFiles = new DefaultTreeModel(withoutFiles);
+                return null;
+            }
+
+            @Override
+            protected void done() {
+                modelWithFiles    = builtWithFiles;
+                modelWithoutFiles = builtWithoutFiles;
+                modelsReady = true;
+
+                showFilesChk  .setEnabled(true);
+                sortBySizeBtn .setEnabled(true);
+                sortByNameBtn .setEnabled(true);
+                expandAllBtn  .setEnabled(true);
+                collapseAllBtn.setEnabled(true);
+
+                activateModel(showFiles);
+                onStatusCallback.accept("Ready.");
+            }
+        };
+        builder.execute();
     }
 
     public void clear() {
-        storedRoot = null;
-        treeModel  = null;
+        storedRoot        = null;
+        treeModel         = null;
+        modelWithFiles    = null;
+        modelWithoutFiles = null;
+        modelsReady       = false;
         tree.setModel(new DefaultTreeModel(new DefaultMutableTreeNode(
                 "No data — select a disk and press Analyze")));
         expandAllBtn  .setEnabled(false);
         collapseAllBtn.setEnabled(false);
         deleteBtn     .setEnabled(false);
+        showFilesChk  .setEnabled(false);
+        sortBySizeBtn .setEnabled(false);
+        sortByNameBtn .setEnabled(false);
     }
 
     public JTree getTree() { return tree; }
 
     public void setOnStatusCallback(Consumer<String>  cb) { onStatusCallback  = cb; }
     public void setOnBusyCallback  (Consumer<Boolean> cb) { onBusyCallback    = cb; }
-    /** @deprecated use {@link #setOnStatusCallback} for the final completion message. */
     public void setOnDeleteCallback(Consumer<String>  cb) { onDeleteCallback  = cb; }
 
     // ═══════════════════════════════════════════════════════════════
-    //  Display-model rebuild
+    //  Display-model management
     // ═══════════════════════════════════════════════════════════════
 
-    private void rebuildDisplayModel() {
-        if (storedRoot == null) return;
+    /**
+     * Instantly swaps to the correct pre-built model. O(1) on the EDT.
+     * Restored expanded paths are matched by user-object identity.
+     */
+    private void activateModel(boolean withFiles) {
+        if (!modelsReady) return;
 
         List<TreePath> expanded = getExpandedPaths();
 
-        DefaultMutableTreeNode displayRoot = copyNode(storedRoot, showFiles);
-        sortNodes(displayRoot, sortBySize);
-
-        treeModel = new DefaultTreeModel(displayRoot);
+        treeModel = withFiles ? modelWithFiles : modelWithoutFiles;
         tree.setModel(treeModel);
         tree.expandRow(0);
 
+        // Best-effort restore of expanded paths
         for (TreePath tp : expanded) tree.expandPath(tp);
         updateDeleteButtonState();
     }
 
-    /** Deep-copies a sub-tree, optionally including file leaves. */
+    /**
+     * Rebuilds both pre-built models in the background (called after deletion
+     * to keep them in sync with storedRoot). Re-applies the active view on completion.
+     */
+    private void rebuildDisplayModel() {
+        if (storedRoot == null) return;
+        modelsReady = false;
+
+        List<TreePath> expanded = getExpandedPaths();
+
+        SwingWorker<Void, Void> builder = new SwingWorker<>() {
+            private DefaultTreeModel builtWithFiles;
+            private DefaultTreeModel builtWithoutFiles;
+
+            @Override
+            protected Void doInBackground() {
+                DefaultMutableTreeNode withFiles    = copyNode(storedRoot, true);
+                DefaultMutableTreeNode withoutFiles = copyNode(storedRoot, false);
+                sortNodes(withFiles,    sortBySize);
+                sortNodes(withoutFiles, sortBySize);
+                builtWithFiles    = new DefaultTreeModel(withFiles);
+                builtWithoutFiles = new DefaultTreeModel(withoutFiles);
+                return null;
+            }
+
+            @Override
+            protected void done() {
+                modelWithFiles    = builtWithFiles;
+                modelWithoutFiles = builtWithoutFiles;
+                modelsReady = true;
+
+                treeModel = showFiles ? modelWithFiles : modelWithoutFiles;
+                tree.setModel(treeModel);
+                tree.expandRow(0);
+                for (TreePath tp : expanded) tree.expandPath(tp);
+                updateDeleteButtonState();
+            }
+        };
+        builder.execute();
+    }
+
+    /** Deep-copies a sub-tree node, including or excluding FileNode leaves. */
     private DefaultMutableTreeNode copyNode(DefaultMutableTreeNode src, boolean includeFiles) {
         DefaultMutableTreeNode copy = new DefaultMutableTreeNode(src.getUserObject());
         for (int i = 0; i < src.getChildCount(); i++) {
@@ -228,10 +332,20 @@ public class DirectoryTreePanel extends JPanel {
 
     private void applySort(boolean bySize) {
         this.sortBySize = bySize;
-        if (storedRoot == null) return;
+        if (storedRoot == null || !modelsReady) return;
+
         List<TreePath> expanded = getExpandedPaths();
-        sortNodes((DefaultMutableTreeNode) treeModel.getRoot(), bySize);
-        treeModel.reload();
+
+        // Re-sort both pre-built models in-place (fast, no deep copy)
+        sortNodes((DefaultMutableTreeNode) modelWithFiles   .getRoot(), bySize);
+        sortNodes((DefaultMutableTreeNode) modelWithoutFiles.getRoot(), bySize);
+        modelWithFiles   .reload();
+        modelWithoutFiles.reload();
+
+        // Reattach the currently active one
+        treeModel = showFiles ? modelWithFiles : modelWithoutFiles;
+        tree.setModel(treeModel);
+        tree.expandRow(0);
         for (TreePath tp : expanded) tree.expandPath(tp);
     }
 
@@ -415,10 +529,12 @@ public class DirectoryTreePanel extends JPanel {
     /** Enables/disables controls that must not be used during deletion. */
     private void setDeletionBusy(boolean busy) {
         deletionInProgress = busy;
-        deleteBtn     .setEnabled(!busy);
-        sortBySizeBtn .setEnabled(!busy);
-        sortByNameBtn .setEnabled(!busy);
-        showFilesChk  .setEnabled(!busy);
+        deleteBtn.setEnabled(!busy);
+        // Sort/filter controls also need models to be ready
+        boolean canInteract = !busy && modelsReady;
+        sortBySizeBtn.setEnabled(canInteract);
+        sortByNameBtn.setEnabled(canInteract);
+        showFilesChk .setEnabled(canInteract);
         onBusyCallback.accept(busy);
     }
 
